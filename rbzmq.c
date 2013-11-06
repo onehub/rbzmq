@@ -56,6 +56,25 @@ typedef unsigned __int64 uint64_t;
 #include <stdint.h>
 #endif
 
+/* 0MQ 2.x / 3.x compatibility */
+#ifndef ZMQ_DONTWAIT
+#   define ZMQ_DONTWAIT   ZMQ_NOBLOCK
+#endif
+#ifndef ZMQ_RCVHWM
+#   define ZMQ_RCVHWM     ZMQ_HWM
+#endif
+#ifndef ZMQ_SNDHWM
+#   define ZMQ_SNDHWM     ZMQ_HWM
+#endif
+#if ZMQ_VERSION_MAJOR == 2
+#   define zmq_ctx_destroy(context) zmq_term(context)
+#   define zmq_msg_send(msg,sock,opt) zmq_send(sock, msg, opt)
+#   define zmq_msg_recv(msg,sock,opt) zmq_recv(sock, msg, opt)
+#   define ZMQ_POLL_MSEC    1000        //  zmq_poll is usec
+#elif ZMQ_VERSION_MAJOR == 3
+#   define ZMQ_POLL_MSEC    1           //  zmq_poll is msec
+#endif
+
 struct zmq_context {
     void *context;
     unsigned refs;
@@ -111,7 +130,7 @@ static void context_free (void *ptr)
 
     if (ctx->refs == 0) {
         if (ctx->context != NULL) {
-            int rc = zmq_term(ctx->context);
+            int rc = zmq_ctx_destroy(ctx->context);
             assert (rc == 0);
         }
 
@@ -151,7 +170,7 @@ static VALUE context_initialize (int argc_, VALUE* argv_, VALUE self_)
     Data_Get_Struct (self_, void, ctx);
 
     assert (ctx->context == NULL);
-    void *zctx = zmq_init (NIL_P (io_threads) ? 1 : NUM2INT (io_threads));
+    void *zctx = zmq_ctx_new();
     if (!zctx) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         return Qnil;
@@ -174,7 +193,7 @@ static VALUE context_initialize (int argc_, VALUE* argv_, VALUE self_)
  *    ETERM. With the exception of ZMQ::Socket#close(), any further operations on
  *    sockets open within context shall fail with an error code of ETERM.
  *
- * 2. After interrupting all blocking calls, zmq_term() shall block until
+ * 2. After interrupting all blocking calls, ZMQ::Context#close() shall block until
  *    the following conditions are satisfied:
  *    * All sockets open within context have been closed with ZMQ::Socket#close().
  *    * For each socket within context, all messages sent by the
@@ -191,7 +210,7 @@ static VALUE context_close (VALUE self_)
     Data_Get_Struct (self_, void, ctx);
     
     if (ctx->context != NULL) {
-        int rc = zmq_term(ctx->context);
+        int rc = zmq_ctx_destroy(ctx->context);
         assert (rc == 0);
 
         ctx->context = NULL;
@@ -292,7 +311,7 @@ static VALUE poll_add_item(VALUE io_, void *ps_) {
 struct zmq_poll_args {
     zmq_pollitem_t *items;
     int nitems;
-    long timeout_usec;
+    long timeout_msec;
     int rc;
 };
 
@@ -300,7 +319,7 @@ static VALUE zmq_poll_blocking (void* args_)
 {
     struct zmq_poll_args *poll_args = (struct zmq_poll_args *)args_;
     
-    poll_args->rc = zmq_poll (poll_args->items, poll_args->nitems, poll_args->timeout_usec);
+    poll_args->rc = zmq_poll (poll_args->items, poll_args->nitems, poll_args->timeout_msec * ZMQ_POLL_MSEC);
     
     return Qnil;
 }
@@ -311,7 +330,7 @@ struct select_arg {
     VALUE readset;
     VALUE writeset;
     VALUE errset;
-    long timeout_usec;
+    long timeout_msec;
     zmq_pollitem_t *items;
 };
 
@@ -346,18 +365,18 @@ static VALUE internal_select(VALUE argval)
     nitems = ps.nitems;
 
 #ifdef HAVE_RUBY_INTERN_H
-    if (arg->timeout_usec != 0) {
+    if (arg->timeout_msec != 0) {
         struct zmq_poll_args poll_args;
         poll_args.items = ps.items;
         poll_args.nitems = ps.nitems;
-        poll_args.timeout_usec = arg->timeout_usec;
+        poll_args.timeout_msec = arg->timeout_msec;
 
         rb_thread_blocking_region (zmq_poll_blocking, (void*)&poll_args, NULL, NULL);
         rc = poll_args.rc;
     }
     else
 #endif
-        rc = zmq_poll (ps.items, ps.nitems, arg->timeout_usec);
+        rc = zmq_poll (ps.items, ps.nitems, arg->timeout_msec * ZMQ_POLL_MSEC);
     
     if (rc == -1) {
         rb_raise(exception_type, "%s", zmq_strerror (zmq_errno ()));
@@ -386,7 +405,7 @@ static VALUE internal_select(VALUE argval)
     return rb_ary_new3 (3, read_active, write_active, err_active);
 }
 
-static VALUE module_select_internal(VALUE readset, VALUE writeset, VALUE errset, long timeout_usec)
+static VALUE module_select_internal(VALUE readset, VALUE writeset, VALUE errset, long timeout_msec)
 {
     size_t nitems;
     struct select_arg arg;
@@ -400,7 +419,7 @@ static VALUE module_select_internal(VALUE readset, VALUE writeset, VALUE errset,
     arg.readset = readset;
     arg.writeset = writeset;
     arg.errset = errset;
-    arg.timeout_usec = timeout_usec;
+    arg.timeout_msec = timeout_msec;
 
     return rb_ensure(internal_select, (VALUE)&arg, (VALUE (*)())xfree, (VALUE)arg.items);
 }
@@ -416,18 +435,18 @@ static VALUE module_select (int argc_, VALUE* argv_, VALUE self_)
     VALUE readset, writeset, errset, timeout;
     rb_scan_args (argc_, argv_, "13", &readset, &writeset, &errset, &timeout);
 
-    long timeout_usec;
+    long timeout_msec;
 
     if (!NIL_P (readset)) Check_Type (readset, T_ARRAY);
     if (!NIL_P (writeset)) Check_Type (writeset, T_ARRAY);
     if (!NIL_P (errset)) Check_Type (errset, T_ARRAY);
     
     if (NIL_P (timeout))
-        timeout_usec = -1;
+        timeout_msec = -1;
     else
-        timeout_usec = (long)(NUM2DBL (timeout) * 1000000);
+        timeout_msec = (long)(NUM2DBL (timeout) * 1000);
 
-    return module_select_internal(readset, writeset, errset, timeout_usec);
+    return module_select_internal(readset, writeset, errset, timeout_msec);
 }
 
 static void socket_free (void *ptr)
@@ -549,7 +568,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Send, Receive, Send, Receive, ...
  * [Outgoing routing strategy] Load-balanced
  * [Incoming routing strategy] Last peer
- * [ZMQ::HWM option action] Block
+ * [ZMQ::SNDHWM option action] Block
  *
  * == ZMQ::REP
  * A socket of type ZMQ::REP is used by a _service_ to receive requests from and
@@ -568,7 +587,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Receive, Send, Receive, Send, ...
  * [Incoming routing strategy] Fair-queued
  * [Outgoing routing stratagy] Last peer
- * [ZMQ::HWM option action] Drop
+ * [ZMQ::RCVHWM option action] Drop
  *
  *
  * = Publish-subscribe pattern
@@ -591,7 +610,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Send only
  * [Incoming routing strategy] N/A
  * [Outgoing routing strategy] Fanout
- * [ZMQ::HWM option action] Drop
+ * [ZMQ::SNDHWM option action] Drop
  *
  * == ZMQ::SUB
  *
@@ -607,7 +626,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Receive only
  * [Incoming routing strategy] Fair-queued
  * [Outgoing routing strategy] N/A
- * [ZMQ::HWM option action] N/A
+ * [ZMQ::RCVHWM option action] N/A
  *
  * = Pipeline pattern
  * The pipeline pattern is used for distributing data to _nodes_ arranged in a
@@ -634,7 +653,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Send only
  * [Incoming routing strategy] N/A
  * [Outgoing routing strategy] Load-balanced
- * [ZMQ::HWM option action] Block
+ * [ZMQ::SNDHWM option action] Block
  *
  * == ZMQ::PULL
  *
@@ -649,7 +668,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Receive only
  * [Incoming routing strategy] Fair-queued
  * [Outgoing routing strategy] N/A
- * [ZMQ::HWM option action] N/A
+ * [ZMQ::RCVHWM option action] N/A
  *
  * = Exclusive pair pattern
  *
@@ -676,7 +695,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Send/receive pattern] Unrestricted
  * [Incoming routing strategy] N/A
  * [Outcoming routing strategy] N/A
- * [ZMQ::HWM option action] Block
+ * [ZMQ::SNDHWM / ZMQ::RCVHWM option action] Block
  */
 
 /*
@@ -702,7 +721,45 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Default value] N/A
  * [Applicable socket types] all
  *
- * == ZMQ::HWM: Retrieve high water mark
+ * == ZMQ::SNDHWM: Retrieve high water mark
+ * The ZMQ::SNDHWM option shall retrieve the high water mark for the specified
+ * _socket_. The high water mark is a hard limit on the maximum number of
+ * outstanding messages 0MQ shall queue in memory for any single peer that the
+ * specified _socket_ is communicating with.
+ *
+ * If this limit has been reached the socket shall enter an exceptional state
+ * and depending on the socket type, 0MQ shall take appropriate action such as
+ * blocking or dropping sent messages. Refer to the individual socket
+ * descriptions in ZMQ::Socket for details on the exact action taken for each
+ * socket type.
+ *
+ * The default ZMQ::SNDHWM value of zero means "no limit".
+ *
+ * [Option value type] Integer
+ * [Option value unit] messages
+ * [Default value] 0
+ * [Applicable socket types] all
+ *
+ * == ZMQ::RCVHWM: Retrieve receive high water mark
+ * The ZMQ::RCVHWM option shall retrieve the high water mark for the specified
+ * _socket_. The high water mark is a hard limit on the maximum number of
+ * outstanding messages 0MQ shall queue in memory for any single peer that the
+ * specified _socket_ is communicating with.
+ *
+ * If this limit has been reached the socket shall enter an exceptional state
+ * and depending on the socket type, 0MQ shall take appropriate action such as
+ * blocking or dropping received messages. Refer to the individual socket
+ * descriptions in ZMQ::Socket for details on the exact action taken for each
+ * socket type.
+ *
+ * The default ZMQ::RCVHWM value of zero means "no limit".
+ *
+ * [Option value type] Integer
+ * [Option value unit] messages
+ * [Default value] 0
+ * [Applicable socket types] all
+ *
+ * == ZMQ::HWM: Retrieve high water mark (0MQ 2.x only)
  * The ZMQ::HWM option shall retrieve the high water mark for the specified
  * _socket_. The high water mark is a hard limit on the maximum number of
  * outstanding messages 0MQ shall queue in memory for any single peer that the
@@ -721,7 +778,7 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * [Default value] 0
  * [Applicable socket types] all
  *
- * == ZMQ::SWAP: Retrieve disk offload size
+ * == ZMQ::SWAP: Retrieve disk offload size (0MQ 2.x only)
  * The ZMQ::SWAP option shall retrieve the disk offload (swap) size for the
  * specified _socket_. A socket which has ZMQ::SWAP set to a non-zero value may
  * exceed it’s high water mark; in this case outstanding messages shall be
@@ -791,28 +848,12 @@ static VALUE context_socket (VALUE self_, VALUE type_)
  * determines the maximum time in seconds that a receiver can be absent from a
  * multicast group before unrecoverable data loss will occur.
  *
- * [Option value type] Integer
+ * [Option value type] Number
  * [Option value unit] seconds
  * [Default value] 10
  * [Applicable socket types] all, when using multicast transports
  *
- * == ZMQ::RECOVERY_IVL_MSEC: Get multicast recovery interval in milliseconds
- * The ZMQ::RECOVERY_IVL_MSEC option shall retrieve the recovery interval, in
- * milliseconds (ms) for multicast transports using the specified socket. The
- * recovery interval determines the maximum time in milliseconds that a receiver
- * can be absent from a multicast group before unrecoverable data loss will occur.
- *
- * For backward compatibility, the default value of ZMQ::RECOVERY_IVL_MSEC is -1
- * indicating that the recovery interval should be obtained from the
- * ZMQ::RECOVERY_IVL option. However, if the ZMQ::RECOVERY_IVL_MSEC value is not
- * zero, then it will take precedence, and be used.
- *
- * [Option value type] Integer
- * [Option value unit] milliseconds
- * [Default value] -1
- * [Applicable socket types] all, when using multicast transports
- *
- * == ZMQ::MCAST_LOOP: Control multicast loopback
+ * == ZMQ::MCAST_LOOP: Control multicast loopback (0MQ 2.x only)
  * The ZMQ::MCAST_LOOP option controls whether data sent via multicast transports
  * can also be received by the sending host via loopback. A value of zero
  * indicates that the loopback functionality is disabled, while the default
@@ -1046,17 +1087,29 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
 	case ZMQ_BACKLOG:
 #if ZMQ_VERSION >= 20101
 	case ZMQ_RECONNECT_IVL_MAX:
-	case ZMQ_RECOVERY_IVL_MSEC:
+#  if ZMQ_VERSION_MAJOR == 2
+  case ZMQ_RECOVERY_IVL_MSEC:
+#  endif
 #endif
 #if ZMQ_VERSION >= 20200
   case ZMQ_SNDTIMEO:
   case ZMQ_RCVTIMEO:
 #endif
+#if ZMQ_VERSION_MAJOR == 3
+  case ZMQ_SNDHWM:
+  case ZMQ_RCVHWM:
+  case ZMQ_RCVMORE:
+  case ZMQ_RATE:
+  case ZMQ_RECOVERY_IVL:
+  case ZMQ_SNDBUF:
+  case ZMQ_RCVBUF:
+#endif
         {
+            int opt = FIX2INT(option_);
             int optval;
             size_t optvalsize = sizeof(optval);
 
-            rc = zmq_getsockopt (s->socket, NUM2INT (option_), (void *)&optval,
+            rc = zmq_getsockopt (s->socket, opt, (void *)&optval,
                                  &optvalsize);
 
             if (rc != 0) {
@@ -1064,22 +1117,34 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
               return Qnil;
             }
 
-            if (NUM2INT (option_) == ZMQ_RCVMORE)
+            switch (NUM2INT (option_)) {
+              case ZMQ_RCVMORE:
                 retval = optval ? Qtrue : Qfalse;
-            else
+                break;
+#if ZMQ_VERSION_MAJOR == 3
+              case ZMQ_RECOVERY_IVL:
+                retval = rb_float_new(optval / 1000.0);
+                break;
+#endif
+              default:
                 retval = INT2NUM (optval);
+            }
         }
         break;
 #endif
-    case ZMQ_RCVMORE:
-    case ZMQ_HWM:
+#ifdef ZMQ_SWAP
     case ZMQ_SWAP:
+#endif
     case ZMQ_AFFINITY:
+#if ZMQ_VERSION_MAJOR == 2
+    case ZMQ_HWM:
+    case ZMQ_RCVMORE:
     case ZMQ_RATE:
     case ZMQ_RECOVERY_IVL:
     case ZMQ_MCAST_LOOP:
     case ZMQ_SNDBUF:
     case ZMQ_RCVBUF:
+#endif
         {
             int64_t optval;
             size_t optvalsize = sizeof(optval);
@@ -1133,7 +1198,45 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
  *
  * The following socket options can be set with the setsockopt() function:
  *
- * == ZMQ::HWM: Set high water mark
+ * == ZMQ::SNDHWM: Set send high water mark
+ * The ZMQ::SNDHWM option shall set the high water mark for the specified _socket_.
+ * The high water mark is a hard limit on the maximum number of outstanding
+ * messages 0MQ shall queue in memory for any single peer that the specified
+ * _socket_ is communicating with.
+ *
+ * If this limit has been reached the socket shall enter an exceptional state
+ * and depending on the socket type, 0MQ shall take appropriate action such as
+ * blocking or dropping sent messages. Refer to the individual socket
+ * descriptions in ZMQ::Socket for details on the exact action taken for each
+ * socket type.
+ *
+ * The default ZMQ::SNDHWM value of zero means "no limit".
+ *
+ * [Option value type] Integer
+ * [Option value unit] messages
+ * [Default value] 0
+ * [Applicable socket types] all
+ *
+ * == ZMQ::RCVHWM: Set receive high water mark
+ * The ZMQ::RCVHWM option shall set the high water mark for the specified _socket_.
+ * The high water mark is a hard limit on the maximum number of outstanding
+ * messages 0MQ shall queue in memory for any single peer that the specified
+ * _socket_ is communicating with.
+ *
+ * If this limit has been reached the socket shall enter an exceptional state
+ * and depending on the socket type, 0MQ shall take appropriate action such as
+ * blocking or dropping received messages. Refer to the individual socket
+ * descriptions in ZMQ::Socket for details on the exact action taken for each
+ * socket type.
+ *
+ * The default ZMQ::RCVHWM value of zero means "no limit".
+ *
+ * [Option value type] Integer
+ * [Option value unit] messages
+ * [Default value] 0
+ * [Applicable socket types] all
+ *
+ * == ZMQ::HWM: Set high water mark (0MQ 2.x only)
  * The ZMQ::HWM option shall set the high water mark for the specified _socket_.
  * The high water mark is a hard limit on the maximum number of outstanding
  * messages 0MQ shall queue in memory for any single peer that the specified
@@ -1152,7 +1255,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
  * [Default value] 0
  * [Applicable socket types] all
  *
- * == ZMQ::SWAP: Set disk offload size
+ * == ZMQ::SWAP: Set disk offload size (0MQ 2.x only)
  * The ZMQ::SWAP option shall set the disk offload (swap) size for the specified
  * socket. A socket which has ZMQ::SWAP set to a non-zero value may exceed it’s
  * high water mark; in this case outstanding messages shall be offloaded to
@@ -1251,32 +1354,12 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
  * needed for recovery will be held in memory. For example, a 1 minute recovery
  * interval at a data rate of 1Gbps requires a 7GB in-memory buffer.
  *
- * [Option value type] Integer
+ * [Option value type] Number
  * [Option value unit] seconds
  * [Default value] 10
  * [Applicable socket types] all, when using multicast transports
  *
- * == ZMQ::RECOVERY_IVL_MSEC: Set multicast recovery interval in milliseconds
- * The ZMQ::RECOVERY_IVL_MSEC option shall set the recovery interval, specified
- * in milliseconds (ms) for multicast transports using the specified socket. The
- * recovery interval determines the maximum time in milliseconds that a receiver
- * can be absent from a multicast group before unrecoverable data loss will occur.
- *
- * A non-zero value of the ZMQ::RECOVERY_IVL_MSEC option will take precedence over
- * the ZMQ::RECOVERY_IVL option, but since the default for the
- * ZMQ::RECOVERY_IVL_MSEC is -1, the default is to use the ZMQ::RECOVERY_IVL option
- * value.
- *
- * <bCaution:</b> Exercise care when setting large recovery intervals as the data
- * needed for recovery will be held in memory. For example, a 1 minute recovery
- * interval at a data rate of 1Gbps requires a 7GB in-memory buffer.
- *
- * [Option value type] Integer
- * [Option value unit] milliseconds
- * [Default value] -1
- * [Applicable socket types] all, when using multicast transports
- *
- * == ZMQ::MCAST_LOOP: Control multicast loopback
+ * == ZMQ::MCAST_LOOP: Control multicast loopback (0MQ 2.x only)
  * The ZMQ::MCAST_LOOP option shall control whether data sent via multicast
  * transports using the specified _socket_ can also be received by the sending
  * host via loopback. A value of zero disables the loopback functionality, while
@@ -1400,14 +1483,18 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     Check_Socket (s);
 
     switch (NUM2INT (option_)) {
-    case ZMQ_HWM:
+#ifdef ZMQ_SWAP
     case ZMQ_SWAP:
+#endif
     case ZMQ_AFFINITY:
+#if ZMQ_VERSION_MAJOR == 2
+    case ZMQ_HWM:
     case ZMQ_RATE:
     case ZMQ_RECOVERY_IVL:
     case ZMQ_MCAST_LOOP:
     case ZMQ_SNDBUF:
     case ZMQ_RCVBUF:
+#endif
 	    {
 	        uint64_t optval = FIX2LONG (optval_);
 
@@ -1423,17 +1510,34 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     case ZMQ_BACKLOG:
 #if ZMQ_VERSION >= 20101
     case ZMQ_RECONNECT_IVL_MAX:
+#  if ZMQ_VERSION_MAJOR == 2
     case ZMQ_RECOVERY_IVL_MSEC:
+#  endif
 #endif
 #if ZMQ_VERSION >= 20200
     case ZMQ_SNDTIMEO:
     case ZMQ_RCVTIMEO:
 #endif
+#if ZMQ_VERSION_MAJOR == 3
+    case ZMQ_SNDHWM:
+    case ZMQ_RCVHWM:
+    case ZMQ_RATE:
+    case ZMQ_RECOVERY_IVL:
+    case ZMQ_SNDBUF:
+    case ZMQ_RCVBUF:
+#endif
         {
-            int optval = FIX2INT (optval_);
+            int opt = FIX2INT(option_);
+            int optval = NUM2INT(optval_);
+
+            if (NUM2INT(option_) == ZMQ_RECOVERY_IVL) {
+#if ZMQ_VERSION_MAJOR == 3
+              optval *= 1000;
+#endif
+            }
 
             //  Forward the code to native 0MQ library.
-            rc = zmq_setsockopt (s->socket, NUM2INT (option_),
+            rc = zmq_setsockopt (s->socket, opt,
                 (void*) &optval, sizeof (optval));
         }
         break;
@@ -1555,7 +1659,7 @@ static VALUE zmq_send_blocking (void* args_)
 {
     struct zmq_send_recv_args *send_args = (struct zmq_send_recv_args *)args_;
 
-    send_args->rc = zmq_send(send_args->socket, send_args->msg, send_args->flags);
+    send_args->rc = zmq_msg_send(send_args->msg, send_args->socket, send_args->flags);
     
     return Qnil;
 }
@@ -1569,7 +1673,7 @@ static VALUE zmq_send_blocking (void* args_)
  * _socket_.  The _flags_ argument is a combination of the flags defined
  * below:
  *
- * [ZMQ::NOBLOCK] Specifies that the operation should be performed in
+ * [ZMQ::DONTWAIT] Specifies that the operation should be performed in
  * non-blocking mode. If the message cannot be queued on the _socket_,
  * the function shall fail and return _false_.
  * [ZMQ::SNDMORE] Specifies that the message being sent is a multi-part message,
@@ -1620,7 +1724,7 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     memcpy (zmq_msg_data (&msg), RSTRING_PTR (msg_), msg_len);
 
 #ifdef HAVE_RUBY_INTERN_H
-    if (!(flags & ZMQ_NOBLOCK)) {
+    if (!(flags & ZMQ_DONTWAIT)) {
         struct zmq_send_recv_args send_args;
         send_args.socket = s->socket;
         send_args.msg = &msg;
@@ -1630,14 +1734,14 @@ static VALUE socket_send (int argc_, VALUE* argv_, VALUE self_)
     }
     else
 #endif
-        rc = zmq_send (s->socket, &msg, flags);
-    if (rc != 0 && zmq_errno () == EAGAIN) {
+        rc = zmq_msg_send (&msg, s->socket, flags);
+    if (rc == -1 && zmq_errno () == EAGAIN) {
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
         return Qfalse;
     }
 
-    if (rc != 0) {
+    if (rc == -1) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
@@ -1654,7 +1758,7 @@ static VALUE zmq_recv_blocking (void* args_)
 {
     struct zmq_send_recv_args *recv_args = (struct zmq_send_recv_args *)args_;
 
-    recv_args->rc = zmq_recv(recv_args->socket, recv_args->msg, recv_args->flags);
+    recv_args->rc = zmq_msg_recv(recv_args->msg, recv_args->socket, recv_args->flags);
     
     return Qnil;
 }
@@ -1669,7 +1773,7 @@ static VALUE zmq_recv_blocking (void* args_)
  * satisfied.  The _flags_ argument is a combination of the flags defined
  * below:
  *
- * [ZMQ::NOBLOCK] Specifies that the operation should be performed in
+ * [ZMQ::DONTWAIT] Specifies that the operation should be performed in
  * non-blocking mode.  If there are no messages available on the _socket_,
  * the recv() function shall fail and return _nil_.
  *
@@ -1704,7 +1808,7 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
     assert (rc == 0);
 
 #ifdef HAVE_RUBY_INTERN_H
-    if (!(flags & ZMQ_NOBLOCK)) {
+    if (!(flags & ZMQ_DONTWAIT)) {
         struct zmq_send_recv_args recv_args;
         recv_args.socket = s->socket;
         recv_args.msg = &msg;
@@ -1715,14 +1819,14 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
     }
     else
 #endif
-        rc = zmq_recv (s->socket, &msg, flags);
-    if (rc != 0 && zmq_errno () == EAGAIN) {
+        rc = zmq_msg_recv (&msg, s->socket, flags);
+    if (rc == -1 && zmq_errno () == EAGAIN) {
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
         return Qnil;
     }
 
-    if (rc != 0) {
+    if (rc == -1) {
         rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
         rc = zmq_msg_close (&msg);
         assert (rc == 0);
@@ -1792,15 +1896,22 @@ void Init_zmq ()
     rb_define_method (socket_type, "recv", socket_recv, -1);
     rb_define_method (socket_type, "close", socket_close, 0);
 
-    rb_define_const (zmq_module, "HWM", INT2NUM (ZMQ_HWM));
+#ifdef ZMQ_SWAP
     rb_define_const (zmq_module, "SWAP", INT2NUM (ZMQ_SWAP));
+#endif
     rb_define_const (zmq_module, "AFFINITY", INT2NUM (ZMQ_AFFINITY));
     rb_define_const (zmq_module, "IDENTITY", INT2NUM (ZMQ_IDENTITY));
     rb_define_const (zmq_module, "SUBSCRIBE", INT2NUM (ZMQ_SUBSCRIBE));
     rb_define_const (zmq_module, "UNSUBSCRIBE", INT2NUM (ZMQ_UNSUBSCRIBE));
     rb_define_const (zmq_module, "RATE", INT2NUM (ZMQ_RATE));
     rb_define_const (zmq_module, "RECOVERY_IVL", INT2NUM (ZMQ_RECOVERY_IVL));
+#if ZMQ_VERSION_MAJOR == 2
     rb_define_const (zmq_module, "MCAST_LOOP", INT2NUM (ZMQ_MCAST_LOOP));
+    rb_define_const (zmq_module, "HWM", INT2NUM (ZMQ_HWM));
+#else
+    rb_define_const (zmq_module, "SNDHWM", INT2NUM (ZMQ_SNDHWM));
+    rb_define_const (zmq_module, "RCVHWM", INT2NUM (ZMQ_RCVHWM));
+#endif
     rb_define_const (zmq_module, "SNDBUF", INT2NUM (ZMQ_SNDBUF));
     rb_define_const (zmq_module, "RCVBUF", INT2NUM (ZMQ_RCVBUF));
     rb_define_const (zmq_module, "SNDMORE", INT2NUM (ZMQ_SNDMORE));
@@ -1815,14 +1926,17 @@ void Init_zmq ()
 #endif
 #if ZMQ_VERSION >= 20101
     rb_define_const (zmq_module, "RECONNECT_IVL_MAX", INT2NUM (ZMQ_RECONNECT_IVL_MAX));
+#  if ZMQ_VERSION_MAJOR == 2
     rb_define_const (zmq_module, "RECOVERY_IVL_MSEC", INT2NUM (ZMQ_RECOVERY_IVL_MSEC));
+#  endif
 #endif
 #if ZMQ_VERSION >= 20200
     rb_define_const (zmq_module, "SNDTIMEO", INT2NUM (ZMQ_SNDTIMEO));
     rb_define_const (zmq_module, "RCVTIMEO", INT2NUM (ZMQ_RCVTIMEO));
 #endif
 
-    rb_define_const (zmq_module, "NOBLOCK", INT2NUM (ZMQ_NOBLOCK));
+    rb_define_const (zmq_module, "NOBLOCK", INT2NUM (ZMQ_DONTWAIT));
+    rb_define_const (zmq_module, "DONTWAIT", INT2NUM (ZMQ_DONTWAIT));
 
     rb_define_const (zmq_module, "PAIR", INT2NUM (ZMQ_PAIR));
     rb_define_const (zmq_module, "SUB", INT2NUM (ZMQ_SUB));
