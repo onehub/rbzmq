@@ -71,7 +71,7 @@ typedef unsigned __int64 uint64_t;
 #   define zmq_msg_send(msg,sock,opt) zmq_send(sock, msg, opt)
 #   define zmq_msg_recv(msg,sock,opt) zmq_recv(sock, msg, opt)
 #   define ZMQ_POLL_MSEC    1000        //  zmq_poll is usec
-#elif ZMQ_VERSION_MAJOR == 3
+#elif ZMQ_VERSION_MAJOR >= 3
 #   define ZMQ_POLL_MSEC    1           //  zmq_poll is msec
 #endif
 
@@ -1099,7 +1099,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
   case ZMQ_SNDTIMEO:
   case ZMQ_RCVTIMEO:
 #endif
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
   case ZMQ_SNDHWM:
   case ZMQ_RCVHWM:
   case ZMQ_RCVMORE:
@@ -1125,7 +1125,7 @@ static VALUE socket_getsockopt (VALUE self_, VALUE option_)
               case ZMQ_RCVMORE:
                 retval = optval ? Qtrue : Qfalse;
                 break;
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
               case ZMQ_RECOVERY_IVL:
                 retval = rb_float_new(optval / 1000.0);
                 break;
@@ -1522,7 +1522,7 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
     case ZMQ_SNDTIMEO:
     case ZMQ_RCVTIMEO:
 #endif
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
     case ZMQ_SNDHWM:
     case ZMQ_RCVHWM:
     case ZMQ_RATE:
@@ -1535,7 +1535,7 @@ static VALUE socket_setsockopt (VALUE self_, VALUE option_,
             int optval = NUM2INT(optval_);
 
             if (NUM2INT(option_) == ZMQ_RECOVERY_IVL) {
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
               optval *= 1000;
 #endif
             }
@@ -1883,7 +1883,7 @@ static VALUE socket_close (VALUE self_)
     return Qnil;
 }
 
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
 /*
  * Document-method: monitor
  *
@@ -2001,7 +2001,7 @@ void Init_zmq ()
     rb_define_method (socket_type, "setsockopt", socket_setsockopt, 2);
     rb_define_method (socket_type, "bind", socket_bind, 1);
     rb_define_method (socket_type, "connect", socket_connect, 1);
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
     rb_define_method (socket_type, "monitor", socket_monitor, -1);
 #endif
     rb_define_method (socket_type, "send", socket_send, -1);
@@ -2046,7 +2046,7 @@ void Init_zmq ()
     rb_define_const (zmq_module, "SNDTIMEO", INT2NUM (ZMQ_SNDTIMEO));
     rb_define_const (zmq_module, "RCVTIMEO", INT2NUM (ZMQ_RCVTIMEO));
 #endif
-#if ZMQ_VERSION_MAJOR == 3
+#if ZMQ_VERSION_MAJOR >= 3
     rb_define_const (zmq_module, "EVENT_ALL", INT2NUM (ZMQ_EVENT_ALL));
     rb_define_const (zmq_module, "EVENT_CONNECTED", INT2NUM (ZMQ_EVENT_CONNECTED));
     rb_define_const (zmq_module, "EVENT_CONNECT_DELAYED",
