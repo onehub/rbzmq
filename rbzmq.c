@@ -83,6 +83,8 @@ struct zmq_context {
 struct zmq_socket {
     void *socket;
     struct zmq_context *context;
+    // Is this socket a monitor?  If C had booleans, this would be one
+    int monitor;
 };
 
 #define Check_Socket(__socket) \
@@ -505,6 +507,8 @@ static VALUE context_socket (VALUE self_, VALUE type_)
      */
     s->context = ctx;
     s->context->refs++;
+    // normal socket here:
+    s->monitor = 0;
 
     s->socket = socket;
 
@@ -1833,8 +1837,16 @@ static VALUE socket_recv (int argc_, VALUE* argv_, VALUE self_)
         return Qnil;
     }
 
-    VALUE message = rb_str_new ((char*) zmq_msg_data (&msg),
-        zmq_msg_size (&msg));
+    VALUE message;
+    // For monitors, signals (i.e., ints) are returned, else the message is a string
+    if (s->monitor == 1) {
+        zmq_event_t event;
+        memcpy(&event, zmq_msg_data(&msg), sizeof(event));
+        message = rb_int_new(event.event);
+    } else {
+        message = rb_str_new ((char*) zmq_msg_data (&msg),
+                              zmq_msg_size (&msg));
+    }
     rc = zmq_msg_close (&msg);
     assert (rc == 0);
     return message;
@@ -1871,6 +1883,103 @@ static VALUE socket_close (VALUE self_)
     return Qnil;
 }
 
+#if ZMQ_VERSION_MAJOR == 3
+/*
+ * Document-method: monitor
+ *
+ * call-seq:
+ *   socket.monitor(events=ZMQ::EVENT_ALL) -> nil
+ *
+ * Creates a new 0MQ pair socket that will publish socket state changes, then
+ * connects to the other end and returns that socket.  The events argument specifies
+ * the events desired; from the list below:
+ *
+ * [ZMQ::EVENT_ALL] listen for all events; the default if no flags passed.
+ *
+ * [ZMQ::EVENT_CONNECT] triggered when a connection is established.
+ *
+ * [ZMQ::EVENT_CONNECT_DELAYED] triggers when an immediate connection attempt is
+ * delayed and it's completion's being polled for.
+ *
+ * [ZMQ::EVENT_RETRIED] triggers when a connection attempt is being handled by
+ * reconnect timer. The reconnect interval's recomputed for each attempt.
+ *
+ * [ZMQ::EVENT_LISTENING] triggers when a socket's successfully bound to a an
+ * interface.
+ *
+ * [ZMQ::EVENT_BIND_FAILED] triggers when a socket could not bind to a given
+ * interface.
+ *
+ * [ZMQ::EVENT_ACCEPTED] triggers when a connection from a remote peer has been
+ * established with a socket's listen address.
+ *
+ * [ZMQ::EVENT_ACCEPT_FAILED] triggers when a connection attempt to a socket's bound
+ * address fails.
+ *
+ * [ZMQ::EVENT_CLOSED] triggers when a connection's underlying descriptor has been
+ * closed.
+ *
+ * [ZMQ::EVENT_CLOSE_FAILED] triggers when a descriptor could not be released back
+ * to the OS.
+ *
+ * [ZMQ::EVENT_DISCONNECTED] triggers when the stream engine (tcp and ipc specific)
+ * detects a corrupted / broken session.
+ */
+static VALUE socket_monitor (int argc_, VALUE* argv_, VALUE self_)
+{
+    VALUE flags_;
+
+    // Get flags, default to ZMQ_EVENT_ALL if 0/nil
+    rb_scan_args (argc_, argv_, "01", &flags_);
+    int flags = NIL_P (flags_) ? 0 : NUM2INT (flags_);
+    if (flags == 0) {
+        flags = ZMQ_EVENT_ALL;
+    }
+
+    struct zmq_socket *s;
+    Data_Get_Struct (self_, struct zmq_socket, s);
+
+    // Set up monitor socket
+    void *monitor_socket = zmq_socket(s->context->context, ZMQ_PAIR);
+    if (!monitor_socket) {
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
+        return Qnil;
+    }
+
+    // Generate name from monitor socket pointer (to get unique uri)
+    char name[40];
+    sprintf(name, "inproc://m%ld.push", (long int)monitor_socket);
+
+    // Set up monitoring end of monitor connection
+    int rc = zmq_socket_monitor(s->socket, name, flags);
+    if (rc != 0) {
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
+        return Qnil;
+    }
+
+    struct zmq_socket *m = ALLOC(struct zmq_socket);
+    // Bind monitor socket to other end
+    rc = zmq_connect(monitor_socket, name);
+    if (rc != 0) {
+        rb_raise (exception_type, "%s", zmq_strerror (zmq_errno ()));
+        return Qnil;
+    }
+
+    /*
+     * Grab a reference on the context, to prevent it from being garbage-
+     * collected before the socket is closed.
+     */
+    m->context = s->context;
+    m->context->refs++;
+    // Our socket is a monitor!  Recv needs to know that at the other end
+    m->monitor = 1;
+
+    m->socket = monitor_socket;
+
+    return Data_Wrap_Struct(socket_type, 0, socket_free, m);
+}
+#endif
+
 void Init_zmq ()
 {
     VALUE zmq_module = rb_define_module ("ZMQ");
@@ -1892,6 +2001,9 @@ void Init_zmq ()
     rb_define_method (socket_type, "setsockopt", socket_setsockopt, 2);
     rb_define_method (socket_type, "bind", socket_bind, 1);
     rb_define_method (socket_type, "connect", socket_connect, 1);
+#if ZMQ_VERSION_MAJOR == 3
+    rb_define_method (socket_type, "monitor", socket_monitor, -1);
+#endif
     rb_define_method (socket_type, "send", socket_send, -1);
     rb_define_method (socket_type, "recv", socket_recv, -1);
     rb_define_method (socket_type, "close", socket_close, 0);
@@ -1934,10 +2046,23 @@ void Init_zmq ()
     rb_define_const (zmq_module, "SNDTIMEO", INT2NUM (ZMQ_SNDTIMEO));
     rb_define_const (zmq_module, "RCVTIMEO", INT2NUM (ZMQ_RCVTIMEO));
 #endif
-
+#if ZMQ_VERSION_MAJOR == 3
+    rb_define_const (zmq_module, "EVENT_ALL", INT2NUM (ZMQ_EVENT_ALL));
+    rb_define_const (zmq_module, "EVENT_CONNECTED", INT2NUM (ZMQ_EVENT_CONNECTED));
+    rb_define_const (zmq_module, "EVENT_CONNECT_DELAYED",
+                     INT2NUM (ZMQ_EVENT_CONNECT_DELAYED));
+    rb_define_const (zmq_module, "EVENT_CONNECT_RETRIED",
+                     INT2NUM (ZMQ_EVENT_CONNECT_RETRIED));
+    rb_define_const (zmq_module, "EVENT_LISTENING", INT2NUM (ZMQ_EVENT_LISTENING));
+    rb_define_const (zmq_module, "EVENT_BIND_FAILED", INT2NUM (ZMQ_EVENT_BIND_FAILED));
+    rb_define_const (zmq_module, "EVENT_ACCEPTED", INT2NUM (ZMQ_EVENT_ACCEPTED));
+    rb_define_const (zmq_module, "EVENT_ACCEPT_FAILED", INT2NUM (ZMQ_EVENT_ACCEPT_FAILED));
+    rb_define_const (zmq_module, "EVENT_CLOSED", INT2NUM (ZMQ_EVENT_CLOSED));
+    rb_define_const (zmq_module, "EVENT_CLOSE_FAILED", INT2NUM (ZMQ_EVENT_CLOSE_FAILED));
+    rb_define_const (zmq_module, "EVENT_DISCONNECTED", INT2NUM (ZMQ_EVENT_DISCONNECTED));
+#endif
     rb_define_const (zmq_module, "NOBLOCK", INT2NUM (ZMQ_DONTWAIT));
     rb_define_const (zmq_module, "DONTWAIT", INT2NUM (ZMQ_DONTWAIT));
-
     rb_define_const (zmq_module, "PAIR", INT2NUM (ZMQ_PAIR));
     rb_define_const (zmq_module, "SUB", INT2NUM (ZMQ_SUB));
     rb_define_const (zmq_module, "PUB", INT2NUM (ZMQ_PUB));
@@ -1946,7 +2071,7 @@ void Init_zmq ()
 #ifdef ZMQ_DEALER
     rb_define_const (zmq_module, "XREQ", INT2NUM (ZMQ_DEALER));
     rb_define_const (zmq_module, "XREP", INT2NUM (ZMQ_ROUTER));
-    
+
     // Deprecated
     rb_define_const (zmq_module, "DEALER", INT2NUM (ZMQ_DEALER));
     rb_define_const (zmq_module, "ROUTER", INT2NUM (ZMQ_ROUTER));
