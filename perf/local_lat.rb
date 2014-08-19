@@ -29,7 +29,7 @@ roundtrip_count = ARGV[2].to_i
 			
 ctx = ZMQ::Context.new(1)
 s = ctx.socket(ZMQ::REP);
-s.setsockopt(ZMQ::HWM, 100);
+s.setsockopt(ZMQ::RCVHWM, 100);
 s.bind(bind_to);
 
 for i in 0...roundtrip_count do
